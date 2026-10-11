@@ -71,6 +71,20 @@ Distribuez ce fichier unique : il installe l'application, crée les
 raccourcis, et propose une case à cocher pour ouvrir les `.set` par
 double-clic avec MT5 Set Editor.
 
+## Labels d'enumerations
+
+Certains parametres (ex: `Trade_Direction`) sont stockes sous forme
+d'entiers dans le fichier `.set`, mais le testeur MT5 affiche des labels
+(`Buy_And_Sell`, `Buy_Only`, `Sell_Only`...).
+
+1. Cliquez sur **Labels enum** dans le panneau de gauche.
+2. Selectionnez le parametre concerne et saisissez les labels dans
+   l'ordre des valeurs entieres (0, 1, 2...).
+3. Validez : les colonnes Valeur/Minimum/Maximum affichent et edient les
+   labels au lieu des nombres.
+
+Un mapping par defaut est fourni pour `Trade_Direction`.
+
 ## Structure du projet
 
 - `main.py` — point d'entrée de l'application.

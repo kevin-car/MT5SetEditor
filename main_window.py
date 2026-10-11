@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from enum_dialog import EnumDialog
+from enum_manager import EnumManager
 from filter_dialog import FilterDialog
 from filter_manager import FilterManager
 from set_parser import Parameter, SetFile
@@ -119,6 +121,37 @@ def _is_time_parameter(param: Parameter) -> bool:
     return time_name or 82800 <= maximum <= 86400
 
 
+def _is_enum_parameter(param: Parameter, enum_manager: EnumManager) -> bool:
+    return bool(enum_manager.get(param.name))
+
+
+def _format_enum(value: Optional[str], enum_manager: EnumManager, param_name: str) -> str:
+    if not value:
+        return ""
+    labels = enum_manager.get(param_name)
+    try:
+        idx = int(value)
+    except ValueError:
+        return value
+    if 0 <= idx < len(labels):
+        return labels[idx]
+    return _format_number(value)
+
+
+def _parse_enum(value: str, enum_manager: EnumManager, param_name: str) -> str:
+    labels = enum_manager.get(param_name)
+    if not labels:
+        return value
+    try:
+        return str(labels.index(value.strip()))
+    except ValueError:
+        try:
+            int(value)
+            return value
+        except ValueError:
+            return ""
+
+
 def _format_time(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -184,8 +217,18 @@ class TimeDelegate(QStyledItemDelegate):
         super().__init__(window)
         self._window = window
 
-    def _is_time_cell(self, index) -> bool:
-        return index.column() in (COL_VALUE, COL_MINIMUM, COL_MAXIMUM) and self._window.is_time_row(index.row())
+    def _cell_type(self, index) -> str:
+        col = index.column()
+        if col not in (COL_VALUE, COL_MINIMUM, COL_MAXIMUM):
+            return "default"
+        param = self._window.param_at_row(index.row())
+        if not param:
+            return "default"
+        if _is_enum_parameter(param, self._window.enum_manager):
+            return "enum"
+        if self._window.is_time_row(index.row()):
+            return "time"
+        return "default"
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
@@ -202,10 +245,16 @@ class TimeDelegate(QStyledItemDelegate):
             painter.setPen(pen)
 
     def createEditor(self, parent, option, index):
-        if not self._is_time_cell(index):
+        cell_type = self._cell_type(index)
+        if cell_type == "default":
             return super().createEditor(parent, option, index)
         combo = QComboBox(parent)
-        combo.addItems(TIME_CHOICES)
+        if cell_type == "enum":
+            param = self._window.param_at_row(index.row())
+            labels = self._window.enum_manager.get(param.name)
+            combo.addItems(labels)
+        else:
+            combo.addItems(TIME_CHOICES)
         combo.setMaxVisibleItems(20)
         combo.activated.connect(lambda _: (self.commitData.emit(combo), self.closeEditor.emit(combo)))
         return combo
@@ -233,6 +282,7 @@ class MainWindow(QMainWindow):
         self.set_file: Optional[SetFile] = None
         self.current_path: Optional[str] = None
         self.filter_manager = FilterManager()
+        self.enum_manager = EnumManager()
 
         self._build_ui()
         self._build_menu()
@@ -262,6 +312,12 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_edit_filter)
         btn_row.addWidget(self.btn_delete_filter)
         left_layout.addLayout(btn_row)
+
+        enum_row = QHBoxLayout()
+        self.btn_enums = QPushButton("Labels enum")
+        self.btn_enums.clicked.connect(self._edit_enums)
+        enum_row.addWidget(self.btn_enums)
+        left_layout.addLayout(enum_row)
 
         left.setLayout(left_layout)
         splitter.addWidget(left)
@@ -334,6 +390,7 @@ class MainWindow(QMainWindow):
         self.btn_new_filter.setEnabled(enabled)
         self.btn_edit_filter.setEnabled(enabled)
         self.btn_delete_filter.setEnabled(enabled)
+        self.btn_enums.setEnabled(enabled)
         self.filter_list.setEnabled(enabled)
 
     # ------------------------------------------------------------- Fichier
@@ -460,6 +517,17 @@ class MainWindow(QMainWindow):
             self._refresh_filter_list()
             self.filter_list.setCurrentRow(0)
 
+    def _edit_enums(self) -> None:
+        current_name = ""
+        row = self.table.currentRow()
+        if row >= 0:
+            param = self.param_at_row(row)
+            if param:
+                current_name = param.name
+        dialog = EnumDialog(self._all_param_names(), self.enum_manager, self, current_name)
+        if dialog.exec():
+            self._populate_table(self.filter_list.currentItem().text() if self.filter_list.currentItem() else ALL_FILTER)
+
     def _on_filter_selected(self, filter_name: str) -> None:
         self.search_edit.clear()
         self._populate_table(filter_name)
@@ -491,6 +559,8 @@ class MainWindow(QMainWindow):
 
             if _is_timeframe_parameter(param):
                 formatter = _format_timeframe
+            elif _is_enum_parameter(param, self.enum_manager):
+                formatter = lambda v, name=param.name: _format_enum(v, self.enum_manager, name)
             elif _is_time_parameter(param):
                 formatter = _format_time
             else:
@@ -521,15 +591,15 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(False)
         self._update_total()
 
-    def _param_at_row(self, row: int) -> Optional[Parameter]:
+    def param_at_row(self, row: int) -> Optional[Parameter]:
         name_item = self.table.item(row, COL_NAME)
         if not self.set_file or not name_item:
             return None
         return self.set_file.get_parameter(name_item.text())
 
     def is_time_row(self, row: int) -> bool:
-        param = self._param_at_row(row)
-        return bool(param) and not _is_timeframe_parameter(param) and _is_time_parameter(param)
+        param = self.param_at_row(row)
+        return bool(param) and not _is_timeframe_parameter(param) and not _is_enum_parameter(param, self.enum_manager) and _is_time_parameter(param)
 
     def _set_steps_cell(self, row: int, param: Parameter) -> None:
         steps = _optimization_steps(param)
@@ -551,13 +621,15 @@ class MainWindow(QMainWindow):
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         row = item.row()
-        param = self._param_at_row(row)
+        param = self.param_at_row(row)
         if not param or item.column() == COL_STEPS:
             return
 
         col = item.column()
         if _is_timeframe_parameter(param):
             value = _parse_timeframe(item.text())
+        elif _is_enum_parameter(param, self.enum_manager):
+            value = _parse_enum(item.text(), self.enum_manager, param.name)
         elif _is_time_parameter(param):
             value = _parse_time(item.text())
         else:
