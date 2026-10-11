@@ -71,19 +71,23 @@ Distribuez ce fichier unique : il installe l'application, crée les
 raccourcis, et propose une case à cocher pour ouvrir les `.set` par
 double-clic avec MT5 Set Editor.
 
-## Labels d'enumerations
+## Listes de choix (comme dans le testeur MT5)
 
-Certains parametres (ex: `Trade_Direction`) sont stockes sous forme
-d'entiers dans le fichier `.set`, mais le testeur MT5 affiche des labels
-(`Buy_And_Sell`, `Buy_Only`, `Sell_Only`...).
+Un double-clic sur Valeur / Minimum / Maximum ouvre une liste déroulante pour :
 
-1. Cliquez sur **Labels enum** dans le panneau de gauche.
-2. Selectionnez le parametre concerne et saisissez les labels dans
-   l'ordre des valeurs entieres (0, 1, 2...).
-3. Validez : les colonnes Valeur/Minimum/Maximum affichent et edient les
-   labels au lieu des nombres.
+- les booléens (`false` / `true`) ;
+- les timeframes (`Current`, `1 Minute`, … `1 Month`) ;
+- les heures (00:00 → 23:55 par pas de 5 min) ;
+- les énumérations, détectées automatiquement (pas = `0` et bornes entières
+  dans le `.set`).
 
-Un mapping par defaut est fourni pour `Trade_Direction`.
+Le `.set` ne contient que la valeur entière des énumérations : les libellés
+affichés par MT5 viennent de l'EA compilé (`.ex5`, chiffré). Les libellés
+des méthodes de moyenne mobile (`*_Method`) et de `Trade_Direction` sont
+fournis. Pour les autres : **clic droit sur la ligne → Définir les
+libellés…**, saisissez le texte de chaque valeur. Ils sont enregistrés
+globalement (`~/.mt5_set_editor/enums.json`) et réutilisés pour tous les
+fichiers. Le fichier `.set` conserve toujours les valeurs entières.
 
 ## Structure du projet
 
@@ -92,4 +96,5 @@ Un mapping par defaut est fourni pour `Trade_Direction`.
 - `filter_dialog.py` — boîte de dialogue de création/édition d'un filtre.
 - `set_parser.py` — lecture/écriture des fichiers `.set`.
 - `filter_manager.py` — persistance des filtres (JSON).
+- `enum_manager.py` / `enum_dialog.py` — libellés des énumérations.
 - `sample.set` — fichier d'exemple pour tester l'application.

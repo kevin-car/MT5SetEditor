@@ -3,22 +3,21 @@ from __future__ import annotations
 
 import os
 from decimal import Decimal, InvalidOperation
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -45,6 +44,11 @@ COL_MAXIMUM = 4
 COL_OPTIMIZE = 5
 COL_STEPS = 6
 COLUMNS = ["Paramètre", "Valeur", "Minimum", "Pas", "Maximum", "Optimiser", "Étapes"]
+KIND_BOOL = "bool"
+KIND_ENUM = "enum"
+KIND_TIMEFRAME = "timeframe"
+KIND_TIME = "time"
+KIND_NUMBER = "number"
 TIME_STEP_SECONDS = 300
 TIME_CHOICES = [
     f"{minutes // 60:02d}:{minutes % 60:02d}" for minutes in range(0, 24 * 60, TIME_STEP_SECONDS // 60)
@@ -118,38 +122,38 @@ def _is_time_parameter(param: Parameter) -> bool:
         maximum = int(param.max or "")
     except ValueError:
         return time_name
-    return time_name or 82800 <= maximum <= 86400
+    return 82800 <= maximum <= 86400
 
 
-def _is_enum_parameter(param: Parameter, enum_manager: EnumManager) -> bool:
-    return bool(enum_manager.get(param.name))
-
-
-def _format_enum(value: Optional[str], enum_manager: EnumManager, param_name: str) -> str:
-    if not value:
-        return ""
-    labels = enum_manager.get(param_name)
+def _is_int(text: Optional[str]) -> bool:
     try:
-        idx = int(value)
+        int((text or "").strip())
     except ValueError:
-        return value
-    if 0 <= idx < len(labels):
-        return labels[idx]
-    return _format_number(value)
+        return False
+    return True
 
 
-def _parse_enum(value: str, enum_manager: EnumManager, param_name: str) -> str:
-    labels = enum_manager.get(param_name)
-    if not labels:
-        return value
-    try:
-        return str(labels.index(value.strip()))
-    except ValueError:
-        try:
-            int(value)
-            return value
-        except ValueError:
-            return ""
+def _looks_like_enum(param: Parameter) -> bool:
+    """MT5 écrit un pas de 0 et des bornes entières pour les énumérations."""
+    return (
+        param.optimizable
+        and (param.min or "").strip() == "0"
+        and all(_is_int(v) for v in (param.value, param.default, param.max))
+    )
+
+
+def _param_kind(param: Parameter, enum_manager: EnumManager) -> str:
+    if (param.value or "").strip().lower() in ("true", "false"):
+        return KIND_BOOL
+    if enum_manager.get(param.name):
+        return KIND_ENUM
+    if _is_timeframe_parameter(param):
+        return KIND_TIMEFRAME
+    if _is_time_parameter(param):
+        return KIND_TIME
+    if _looks_like_enum(param):
+        return KIND_ENUM
+    return KIND_NUMBER
 
 
 def _format_time(value: Optional[str]) -> str:
@@ -180,14 +184,21 @@ def _parse_time(value: str) -> str:
     return str(hours * 3600 + minutes * 60 + seconds)
 
 
-def _optimization_steps(param: Parameter) -> Optional[int]:
+def _enum_values(param: Parameter, labels: Dict[int, str]) -> List[int]:
+    if labels:
+        return list(labels)
+    bounds = [int(v) for v in (param.value, param.default, param.max) if _is_int(v)]
+    return list(range(min(bounds), max(bounds) + 1)) if bounds else []
+
+
+def _optimization_steps(param: Parameter, kind: str, labels: Dict[int, str]) -> Optional[int]:
     """Nombre de passes d'optimisation pour un paramètre (colonne 'Étapes' de MT5)."""
     if not param.optimizable:
         return None
     start = (param.default or "").strip().lower()
     step = (param.min or "").strip()
     stop = (param.max or "").strip().lower()
-    if start in ("true", "false") or stop in ("true", "false"):
+    if kind == KIND_BOOL:
         return 1 if start == stop else 2
     try:
         start_d, step_d, stop_d = Decimal(start), Decimal(step or "0"), Decimal(stop)
@@ -195,11 +206,13 @@ def _optimization_steps(param: Parameter) -> Optional[int]:
         return None
     if stop_d < start_d:
         return 0
+    if kind == KIND_ENUM and labels:
+        return sum(1 for value in labels if start_d <= value <= stop_d)
     if step_d > 0:
         return int((stop_d - start_d) / step_d) + 1
-    if _is_timeframe_parameter(param):
+    if kind == KIND_TIMEFRAME:
         return sum(1 for tf in TIMEFRAMES if start_d <= tf <= stop_d)
-    if _is_time_parameter(param):
+    if kind == KIND_TIME:
         return int((stop_d - start_d) / TIME_STEP_SECONDS) + 1
     if start_d == start_d.to_integral_value() and stop_d == stop_d.to_integral_value():
         return int(stop_d - start_d) + 1
@@ -210,51 +223,32 @@ def _format_count(count: int) -> str:
     return f"{count:,}".replace(",", " ")
 
 
-class TimeDelegate(QStyledItemDelegate):
-    """Liste déroulante des heures par pas de 5 minutes, comme dans le testeur MT5."""
+class ChoiceDelegate(QStyledItemDelegate):
+    """Listes déroulantes (heures, timeframes, énumérations, booléens) comme dans le testeur MT5."""
 
     def __init__(self, window: "MainWindow") -> None:
         super().__init__(window)
         self._window = window
 
-    def _cell_type(self, index) -> str:
-        col = index.column()
-        if col not in (COL_VALUE, COL_MINIMUM, COL_MAXIMUM):
-            return "default"
-        param = self._window.param_at_row(index.row())
-        if not param:
-            return "default"
-        if _is_enum_parameter(param, self._window.enum_manager):
-            return "enum"
-        if self._window.is_time_row(index.row()):
-            return "time"
-        return "default"
-
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         col = index.column()
-        if col == COL_MINIMUM:
+        if col in (COL_MINIMUM, COL_MAXIMUM):
             pen = painter.pen()
             painter.setPen(option.palette.mid().color())
-            painter.drawLine(option.rect.topLeft(), option.rect.bottomLeft())
-            painter.setPen(pen)
-        elif col == COL_MAXIMUM:
-            pen = painter.pen()
-            painter.setPen(option.palette.mid().color())
-            painter.drawLine(option.rect.topRight(), option.rect.bottomRight())
+            rect = option.rect
+            if col == COL_MINIMUM:
+                painter.drawLine(rect.topLeft(), rect.bottomLeft())
+            else:
+                painter.drawLine(rect.topRight(), rect.bottomRight())
             painter.setPen(pen)
 
     def createEditor(self, parent, option, index):
-        cell_type = self._cell_type(index)
-        if cell_type == "default":
+        choices = self._window.choices_for(index.row(), index.column())
+        if not choices:
             return super().createEditor(parent, option, index)
         combo = QComboBox(parent)
-        if cell_type == "enum":
-            param = self._window.param_at_row(index.row())
-            labels = self._window.enum_manager.get(param.name)
-            combo.addItems(labels)
-        else:
-            combo.addItems(TIME_CHOICES)
+        combo.addItems(choices)
         combo.setMaxVisibleItems(20)
         combo.activated.connect(lambda _: (self.commitData.emit(combo), self.closeEditor.emit(combo)))
         return combo
@@ -283,6 +277,7 @@ class MainWindow(QMainWindow):
         self.current_path: Optional[str] = None
         self.filter_manager = FilterManager()
         self.enum_manager = EnumManager()
+        self._kinds: Dict[str, str] = {}
 
         self._build_ui()
         self._build_menu()
@@ -313,12 +308,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_delete_filter)
         left_layout.addLayout(btn_row)
 
-        enum_row = QHBoxLayout()
-        self.btn_enums = QPushButton("Labels enum")
-        self.btn_enums.clicked.connect(self._edit_enums)
-        enum_row.addWidget(self.btn_enums)
-        left_layout.addLayout(enum_row)
-
         left.setLayout(left_layout)
         splitter.addWidget(left)
 
@@ -342,8 +331,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(COL_STEPS, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
-        self.table.setItemDelegate(TimeDelegate(self))
+        self.table.setItemDelegate(ChoiceDelegate(self))
         self.table.itemChanged.connect(self._on_item_changed)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_menu)
         right_layout.addWidget(self.table)
 
         right.setLayout(right_layout)
@@ -390,7 +381,6 @@ class MainWindow(QMainWindow):
         self.btn_new_filter.setEnabled(enabled)
         self.btn_edit_filter.setEnabled(enabled)
         self.btn_delete_filter.setEnabled(enabled)
-        self.btn_enums.setEnabled(enabled)
         self.filter_list.setEnabled(enabled)
 
     # ------------------------------------------------------------- Fichier
@@ -410,6 +400,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.set_file = SetFile.load(path)
+            self._kinds.clear()
         except OSError as exc:
             QMessageBox.critical(self, "Erreur", f"Impossible d'ouvrir le fichier :\n{exc}")
             return
@@ -517,17 +508,6 @@ class MainWindow(QMainWindow):
             self._refresh_filter_list()
             self.filter_list.setCurrentRow(0)
 
-    def _edit_enums(self) -> None:
-        current_name = ""
-        row = self.table.currentRow()
-        if row >= 0:
-            param = self.param_at_row(row)
-            if param:
-                current_name = param.name
-        dialog = EnumDialog(self._all_param_names(), self.enum_manager, self, current_name)
-        if dialog.exec():
-            self._populate_table(self.filter_list.currentItem().text() if self.filter_list.currentItem() else ALL_FILTER)
-
     def _on_filter_selected(self, filter_name: str) -> None:
         self.search_edit.clear()
         self._populate_table(filter_name)
@@ -557,21 +537,22 @@ class MainWindow(QMainWindow):
             name_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             self.table.setItem(row, COL_NAME, name_item)
 
-            if _is_timeframe_parameter(param):
-                formatter = _format_timeframe
-            elif _is_enum_parameter(param, self.enum_manager):
-                formatter = lambda v, name=param.name: _format_enum(v, self.enum_manager, name)
-            elif _is_time_parameter(param):
-                formatter = _format_time
-            else:
-                formatter = _format_number
-            value_item = QTableWidgetItem(formatter(param.value))
+            kind = self.kind_of(param)
+            value_item = QTableWidgetItem(self._format(param, param.value))
+            if kind == KIND_ENUM:
+                tip = "Clic droit pour modifier les libellés"
+                name_item.setToolTip(tip)
+                value_item.setToolTip(tip)
             self.table.setItem(row, COL_VALUE, value_item)
 
             if param.optimizable:
-                minimum_item = QTableWidgetItem(formatter(param.default))
-                step_item = QTableWidgetItem(formatter(param.min))
-                maximum_item = QTableWidgetItem(formatter(param.max))
+                minimum_item = QTableWidgetItem(self._format(param, param.default))
+                if kind in (KIND_BOOL, KIND_ENUM, KIND_TIMEFRAME):
+                    step_item = QTableWidgetItem("")
+                    step_item.setFlags(Qt.ItemIsEnabled)
+                else:
+                    step_item = QTableWidgetItem(self._format(param, param.min, step=True))
+                maximum_item = QTableWidgetItem(self._format(param, param.max))
                 self.table.setItem(row, COL_MINIMUM, minimum_item)
                 self.table.setItem(row, COL_STEP, step_item)
                 self.table.setItem(row, COL_MAXIMUM, maximum_item)
@@ -597,12 +578,80 @@ class MainWindow(QMainWindow):
             return None
         return self.set_file.get_parameter(name_item.text())
 
-    def is_time_row(self, row: int) -> bool:
+    def kind_of(self, param: Parameter) -> str:
+        # Mis en cache : le type ne doit pas changer pendant l'édition (ex. pas modifié).
+        if param.name not in self._kinds:
+            self._kinds[param.name] = _param_kind(param, self.enum_manager)
+        return self._kinds[param.name]
+
+    def _enum_labels(self, param: Parameter) -> Dict[int, str]:
+        return self.enum_manager.get(param.name) if self.kind_of(param) == KIND_ENUM else {}
+
+    def _format(self, param: Parameter, value: Optional[str], step: bool = False) -> str:
+        kind = self.kind_of(param)
+        if kind == KIND_TIME:
+            return _format_time(value)
+        if step:
+            return _format_number(value)
+        if kind == KIND_TIMEFRAME:
+            return _format_timeframe(value)
+        if kind == KIND_ENUM and _is_int(value):
+            return self._enum_labels(param).get(int(value), _format_number(value))
+        return _format_number(value)
+
+    def _parse(self, param: Parameter, text: str, step: bool = False) -> str:
+        kind = self.kind_of(param)
+        if kind == KIND_TIME:
+            return _parse_time(text)
+        if step:
+            return text
+        if kind == KIND_TIMEFRAME:
+            return _parse_timeframe(text)
+        if kind == KIND_ENUM:
+            reverse = {label: str(value) for value, label in self._enum_labels(param).items()}
+            return reverse.get(text.strip(), text)
+        return text
+
+    def choices_for(self, row: int, col: int) -> List[str]:
         param = self.param_at_row(row)
-        return bool(param) and not _is_timeframe_parameter(param) and not _is_enum_parameter(param, self.enum_manager) and _is_time_parameter(param)
+        if not param or col not in (COL_VALUE, COL_MINIMUM, COL_MAXIMUM):
+            return []
+        kind = self.kind_of(param)
+        if kind == KIND_BOOL:
+            return ["false", "true"]
+        if kind == KIND_TIMEFRAME:
+            return list(TIMEFRAMES.values())
+        if kind == KIND_TIME:
+            return TIME_CHOICES
+        if kind == KIND_ENUM:
+            labels = self._enum_labels(param)
+            return [labels.get(v, str(v)) for v in _enum_values(param, labels)]
+        return []
+
+    def _show_table_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        param = self.param_at_row(row) if row >= 0 else None
+        if not param:
+            return
+        kind = self.kind_of(param)
+        if kind != KIND_ENUM and not (kind == KIND_NUMBER and _is_int(param.value)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction(f"Définir les libellés de « {param.name} »…")
+        if menu.exec(self.table.viewport().mapToGlobal(pos)) == act:
+            self._edit_enum_labels(param)
+
+    def _edit_enum_labels(self, param: Parameter) -> None:
+        labels = self.enum_manager.get(param.name)
+        dialog = EnumDialog(param.name, set(_enum_values(param, {})) | {0}, labels, self)
+        if dialog.exec():
+            self.enum_manager.set_labels(param.name, dialog.labels())
+            self._kinds.clear()
+            current = self.filter_list.currentItem()
+            self._populate_table(current.text() if current else ALL_FILTER)
 
     def _set_steps_cell(self, row: int, param: Parameter) -> None:
-        steps = _optimization_steps(param)
+        steps = _optimization_steps(param, self.kind_of(param), self._enum_labels(param))
         if not param.optimize or steps is None:
             text = ""
         else:
@@ -616,7 +665,7 @@ class MainWindow(QMainWindow):
         params = [p for p in self.set_file.parameters if p.optimizable and p.optimize] if self.set_file else []
         total = 1 if params else 0
         for param in params:
-            total *= _optimization_steps(param) or 1
+            total *= _optimization_steps(param, self.kind_of(param), self._enum_labels(param)) or 1
         self.total_label.setText(f"Combinaisons : {_format_count(total)}")
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
@@ -626,14 +675,7 @@ class MainWindow(QMainWindow):
             return
 
         col = item.column()
-        if _is_timeframe_parameter(param):
-            value = _parse_timeframe(item.text())
-        elif _is_enum_parameter(param, self.enum_manager):
-            value = _parse_enum(item.text(), self.enum_manager, param.name)
-        elif _is_time_parameter(param):
-            value = _parse_time(item.text())
-        else:
-            value = item.text()
+        value = self._parse(param, item.text(), step=col == COL_STEP)
         if col == COL_VALUE:
             param.value = value
         elif col == COL_MINIMUM:
