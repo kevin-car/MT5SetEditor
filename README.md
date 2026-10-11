@@ -52,6 +52,25 @@ pyinstaller --noconsole --onefile --name "MT5SetEditor" main.py
 
 L'exécutable sera généré dans le dossier `dist/`.
 
+## Générer un installateur Windows (setup.exe)
+
+Un installateur classique (installation dans `Program Files`, raccourcis
+Menu Démarrer / Bureau, entrée dans "Applications et fonctionnalités",
+désinstallation propre, association optionnelle des fichiers `.set`) peut
+être généré avec [Inno Setup](https://jrsoftware.org/isinfo.php) (gratuit) :
+
+1. Construire l'exécutable (`dist\MT5SetEditor.exe`, voir ci-dessus).
+2. Installer Inno Setup : `winget install --id JRSoftware.InnoSetup -e`
+3. Compiler le script `installer.iss` fourni :
+   ```powershell
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer.iss
+   ```
+4. L'installateur est généré dans `installer_output\MT5SetEditor_Setup.exe`.
+
+Distribuez ce fichier unique : il installe l'application, crée les
+raccourcis, et propose une case à cocher pour ouvrir les `.set` par
+double-clic avec MT5 Set Editor.
+
 ## Structure du projet
 
 - `main.py` — point d'entrée de l'application.

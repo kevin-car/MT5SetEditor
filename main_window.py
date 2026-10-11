@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal, InvalidOperation
 from typing import List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -20,9 +22,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -35,11 +37,191 @@ ALL_FILTER = "Tous les paramètres"
 
 COL_NAME = 0
 COL_VALUE = 1
-COL_DEFAULT = 2
-COL_MIN = 3
-COL_MAX = 4
+COL_MINIMUM = 2
+COL_STEP = 3
+COL_MAXIMUM = 4
 COL_OPTIMIZE = 5
-COLUMNS = ["Paramètre", "Valeur", "Défaut", "Min", "Max", "Optimiser"]
+COL_STEPS = 6
+COLUMNS = ["Paramètre", "Valeur", "Minimum", "Pas", "Maximum", "Optimiser", "Étapes"]
+TIME_STEP_SECONDS = 300
+TIME_CHOICES = [
+    f"{minutes // 60:02d}:{minutes % 60:02d}" for minutes in range(0, 24 * 60, TIME_STEP_SECONDS // 60)
+]
+TIMEFRAMES = {
+    0: "Current",
+    1: "1 Minute",
+    2: "2 Minutes",
+    3: "3 Minutes",
+    4: "4 Minutes",
+    5: "5 Minutes",
+    6: "6 Minutes",
+    10: "10 Minutes",
+    12: "12 Minutes",
+    15: "15 Minutes",
+    20: "20 Minutes",
+    30: "30 Minutes",
+    16385: "1 Hour",
+    16386: "2 Hours",
+    16387: "3 Hours",
+    16388: "4 Hours",
+    16390: "6 Hours",
+    16392: "8 Hours",
+    16396: "12 Hours",
+    16408: "1 Day",
+    32769: "1 Week",
+    49153: "1 Month",
+}
+TIMEFRAME_VALUES = {label.lower(): str(value) for value, label in TIMEFRAMES.items()}
+
+
+def _format_number(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        return value
+    if number == 0:
+        return "0"
+    formatted = format(number, "f")
+    return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+
+
+def _is_timeframe_parameter(param: Parameter) -> bool:
+    normalized_name = param.name.lower().replace("-", "_").replace(" ", "_")
+    return normalized_name.endswith("_tf") or param.max == "49153"
+
+
+def _format_timeframe(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        return TIMEFRAMES.get(int(value), _format_number(value))
+    except ValueError:
+        return value
+
+
+def _parse_timeframe(value: str) -> str:
+    return TIMEFRAME_VALUES.get(value.strip().lower(), value)
+
+
+def _is_time_parameter(param: Parameter) -> bool:
+    normalized_name = param.name.lower().replace("-", "_").replace(" ", "_")
+    time_name = (
+        normalized_name in {"start", "stop"}
+        or normalized_name.endswith("_hour")
+        or "_hour_" in normalized_name
+    )
+    try:
+        maximum = int(param.max or "")
+    except ValueError:
+        return time_name
+    return time_name or 82800 <= maximum <= 86400
+
+
+def _format_time(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        seconds = int(value)
+    except ValueError:
+        return _format_number(value)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}" if seconds == 0 else f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _parse_time(value: str) -> str:
+    if ":" not in value:
+        return value
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        return value
+    try:
+        hours, minutes = int(parts[0]), int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return value
+    if hours < 0 or minutes not in range(60) or seconds not in range(60):
+        return value
+    return str(hours * 3600 + minutes * 60 + seconds)
+
+
+def _optimization_steps(param: Parameter) -> Optional[int]:
+    """Nombre de passes d'optimisation pour un paramètre (colonne 'Étapes' de MT5)."""
+    if not param.optimizable:
+        return None
+    start = (param.default or "").strip().lower()
+    step = (param.min or "").strip()
+    stop = (param.max or "").strip().lower()
+    if start in ("true", "false") or stop in ("true", "false"):
+        return 1 if start == stop else 2
+    try:
+        start_d, step_d, stop_d = Decimal(start), Decimal(step or "0"), Decimal(stop)
+    except InvalidOperation:
+        return None
+    if stop_d < start_d:
+        return 0
+    if step_d > 0:
+        return int((stop_d - start_d) / step_d) + 1
+    if _is_timeframe_parameter(param):
+        return sum(1 for tf in TIMEFRAMES if start_d <= tf <= stop_d)
+    if _is_time_parameter(param):
+        return int((stop_d - start_d) / TIME_STEP_SECONDS) + 1
+    if start_d == start_d.to_integral_value() and stop_d == stop_d.to_integral_value():
+        return int(stop_d - start_d) + 1
+    return 1
+
+
+def _format_count(count: int) -> str:
+    return f"{count:,}".replace(",", " ")
+
+
+class TimeDelegate(QStyledItemDelegate):
+    """Liste déroulante des heures par pas de 5 minutes, comme dans le testeur MT5."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self._window = window
+
+    def _is_time_cell(self, index) -> bool:
+        return index.column() in (COL_VALUE, COL_MINIMUM, COL_MAXIMUM) and self._window.is_time_row(index.row())
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        col = index.column()
+        if col == COL_MINIMUM:
+            pen = painter.pen()
+            painter.setPen(option.palette.mid().color())
+            painter.drawLine(option.rect.topLeft(), option.rect.bottomLeft())
+            painter.setPen(pen)
+        elif col == COL_MAXIMUM:
+            pen = painter.pen()
+            painter.setPen(option.palette.mid().color())
+            painter.drawLine(option.rect.topRight(), option.rect.bottomRight())
+            painter.setPen(pen)
+
+    def createEditor(self, parent, option, index):
+        if not self._is_time_cell(index):
+            return super().createEditor(parent, option, index)
+        combo = QComboBox(parent)
+        combo.addItems(TIME_CHOICES)
+        combo.setMaxVisibleItems(20)
+        combo.activated.connect(lambda _: (self.commitData.emit(combo), self.closeEditor.emit(combo)))
+        return combo
+
+    def setEditorData(self, editor, index):
+        if not isinstance(editor, QComboBox):
+            return super().setEditorData(editor, index)
+        text = index.data() or ""
+        if editor.findText(text) < 0:
+            editor.addItem(text)
+        editor.setCurrentText(text)
+
+    def setModelData(self, editor, model, index):
+        if not isinstance(editor, QComboBox):
+            return super().setModelData(editor, model, index)
+        model.setData(index, editor.currentText())
 
 
 class MainWindow(QMainWindow):
@@ -101,8 +283,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(COL_NAME, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(COL_VALUE, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(COL_STEPS, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.table.setItemDelegate(TimeDelegate(self))
         self.table.itemChanged.connect(self._on_item_changed)
         right_layout.addWidget(self.table)
 
@@ -117,9 +301,6 @@ class MainWindow(QMainWindow):
         self._set_controls_enabled(False)
 
     def _build_menu(self) -> None:
-        toolbar = QToolBar("Principal")
-        self.addToolBar(toolbar)
-
         act_open = QAction("Ouvrir...", self)
         act_open.setShortcut(QKeySequence.Open)
         act_open.triggered.connect(self.open_file)
@@ -132,9 +313,6 @@ class MainWindow(QMainWindow):
         act_save_as.setShortcut(QKeySequence.SaveAs)
         act_save_as.triggered.connect(self.save_file_as)
 
-        for act in (act_open, act_save, act_save_as):
-            toolbar.addAction(act)
-
         menu_file = self.menuBar().addMenu("Fichier")
         menu_file.addAction(act_open)
         menu_file.addAction(act_save)
@@ -143,6 +321,12 @@ class MainWindow(QMainWindow):
         act_quit = QAction("Quitter", self)
         act_quit.triggered.connect(self.close)
         menu_file.addAction(act_quit)
+
+        self.total_label = QLabel()
+        self.total_label.setStyleSheet("font-weight: bold; padding: 2px 10px;")
+        self.total_label.setToolTip("Nombre total de combinaisons pour les paramètres cochés « Optimiser »")
+        self.menuBar().setCornerWidget(self.total_label, Qt.TopRightCorner)
+        self._update_total()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.table.setEnabled(enabled)
@@ -305,16 +489,22 @@ class MainWindow(QMainWindow):
             name_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             self.table.setItem(row, COL_NAME, name_item)
 
-            value_item = QTableWidgetItem(param.value)
+            if _is_timeframe_parameter(param):
+                formatter = _format_timeframe
+            elif _is_time_parameter(param):
+                formatter = _format_time
+            else:
+                formatter = _format_number
+            value_item = QTableWidgetItem(formatter(param.value))
             self.table.setItem(row, COL_VALUE, value_item)
 
             if param.optimizable:
-                default_item = QTableWidgetItem(param.default or "")
-                min_item = QTableWidgetItem(param.min or "")
-                max_item = QTableWidgetItem(param.max or "")
-                self.table.setItem(row, COL_DEFAULT, default_item)
-                self.table.setItem(row, COL_MIN, min_item)
-                self.table.setItem(row, COL_MAX, max_item)
+                minimum_item = QTableWidgetItem(formatter(param.default))
+                step_item = QTableWidgetItem(formatter(param.min))
+                maximum_item = QTableWidgetItem(formatter(param.max))
+                self.table.setItem(row, COL_MINIMUM, minimum_item)
+                self.table.setItem(row, COL_STEP, step_item)
+                self.table.setItem(row, COL_MAXIMUM, maximum_item)
 
                 optimize_item = QTableWidgetItem()
                 optimize_item.setFlags(
@@ -323,31 +513,67 @@ class MainWindow(QMainWindow):
                 optimize_item.setCheckState(Qt.Checked if param.optimize else Qt.Unchecked)
                 self.table.setItem(row, COL_OPTIMIZE, optimize_item)
             else:
-                for col in (COL_DEFAULT, COL_MIN, COL_MAX, COL_OPTIMIZE):
+                for col in (COL_MINIMUM, COL_STEP, COL_MAXIMUM, COL_OPTIMIZE):
                     empty_item = QTableWidgetItem("")
                     empty_item.setFlags(Qt.NoItemFlags)
                     self.table.setItem(row, col, empty_item)
+            self._set_steps_cell(row, param)
         self.table.blockSignals(False)
+        self._update_total()
+
+    def _param_at_row(self, row: int) -> Optional[Parameter]:
+        name_item = self.table.item(row, COL_NAME)
+        if not self.set_file or not name_item:
+            return None
+        return self.set_file.get_parameter(name_item.text())
+
+    def is_time_row(self, row: int) -> bool:
+        param = self._param_at_row(row)
+        return bool(param) and not _is_timeframe_parameter(param) and _is_time_parameter(param)
+
+    def _set_steps_cell(self, row: int, param: Parameter) -> None:
+        steps = _optimization_steps(param)
+        if not param.optimize or steps is None:
+            text = ""
+        else:
+            text = _format_count(steps)
+        item = QTableWidgetItem(text)
+        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table.setItem(row, COL_STEPS, item)
+
+    def _update_total(self) -> None:
+        params = [p for p in self.set_file.parameters if p.optimizable and p.optimize] if self.set_file else []
+        total = 1 if params else 0
+        for param in params:
+            total *= _optimization_steps(param) or 1
+        self.total_label.setText(f"Combinaisons : {_format_count(total)}")
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if not self.set_file:
-            return
         row = item.row()
-        name_item = self.table.item(row, COL_NAME)
-        if not name_item:
-            return
-        param = self.set_file.get_parameter(name_item.text())
-        if not param:
+        param = self._param_at_row(row)
+        if not param or item.column() == COL_STEPS:
             return
 
         col = item.column()
+        if _is_timeframe_parameter(param):
+            value = _parse_timeframe(item.text())
+        elif _is_time_parameter(param):
+            value = _parse_time(item.text())
+        else:
+            value = item.text()
         if col == COL_VALUE:
-            param.value = item.text()
-        elif col == COL_DEFAULT:
-            param.default = item.text()
-        elif col == COL_MIN:
-            param.min = item.text()
-        elif col == COL_MAX:
-            param.max = item.text()
+            param.value = value
+        elif col == COL_MINIMUM:
+            param.default = value
+        elif col == COL_STEP:
+            param.min = value
+        elif col == COL_MAXIMUM:
+            param.max = value
         elif col == COL_OPTIMIZE and param.optimizable:
             param.optimize = item.checkState() == Qt.Checked
+
+        self.table.blockSignals(True)
+        self._set_steps_cell(row, param)
+        self.table.blockSignals(False)
+        self._update_total()
