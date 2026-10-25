@@ -275,6 +275,7 @@ class MainWindow(QMainWindow):
 
         self.set_file: Optional[SetFile] = None
         self.current_path: Optional[str] = None
+        self._saved_snapshot: List[str] = []
         self.filter_manager = FilterManager()
         self.enum_manager = EnumManager()
         self._kinds: Dict[str, str] = {}
@@ -384,7 +385,44 @@ class MainWindow(QMainWindow):
         self.filter_list.setEnabled(enabled)
 
     # ------------------------------------------------------------- Fichier
+    def _snapshot(self) -> List[str]:
+        return [entry.to_line() for entry in self.set_file.entries] if self.set_file else []
+
+    def is_modified(self) -> bool:
+        return bool(self.set_file) and self._snapshot() != self._saved_snapshot
+
+    def _update_title(self) -> None:
+        name = f" — {os.path.basename(self.current_path)}[*]" if self.current_path else ""
+        self.setWindowTitle(f"Éditeur de fichiers .set MT5{name}")
+        self.setWindowModified(self.is_modified())
+
+    def maybe_save(self) -> bool:
+        """Demande s'il faut enregistrer les modifications. Retourne False si l'utilisateur annule."""
+        if not self.is_modified():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Modifications non enregistrées")
+        box.setText(f"Le fichier « {os.path.basename(self.current_path or 'sans nom')} » a été modifié.")
+        box.setInformativeText("Voulez-vous enregistrer les modifications ?")
+        btn_save = box.addButton("Enregistrer", QMessageBox.AcceptRole)
+        btn_discard = box.addButton("Ne pas enregistrer", QMessageBox.DestructiveRole)
+        box.addButton("Annuler", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_save)
+        box.exec()
+        if box.clickedButton() == btn_save:
+            return self.save_file(show_message=False)
+        return box.clickedButton() == btn_discard
+
+    def closeEvent(self, event) -> None:
+        if self.maybe_save():
+            event.accept()
+        else:
+            event.ignore()
+
     def open_file(self) -> None:
+        if not self.maybe_save():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Ouvrir un fichier .set", "", "Fichiers .set (*.set);;Tous les fichiers (*.*)"
         )
@@ -406,37 +444,44 @@ class MainWindow(QMainWindow):
             return
 
         self.current_path = path
-        self.setWindowTitle(f"Éditeur de fichiers .set MT5 — {os.path.basename(path)}")
+        self._saved_snapshot = self._snapshot()
+        self._update_title()
         self._set_controls_enabled(True)
         self._refresh_filter_list()
         self.filter_list.setCurrentRow(0)  # affiche "Tous les paramètres"
 
-    def save_file(self) -> None:
+    def save_file(self, show_message: bool = True) -> bool:
         if not self.set_file:
-            return
+            return False
         if not self.current_path:
-            self.save_file_as()
-            return
+            return self.save_file_as(show_message)
         try:
             self.set_file.save(self.current_path)
         except OSError as exc:
             QMessageBox.critical(self, "Erreur", f"Impossible d'enregistrer :\n{exc}")
-            return
-        QMessageBox.information(self, "Enregistré", "Fichier enregistré avec succès.")
+            return False
+        self._saved_snapshot = self._snapshot()
+        self._update_title()
+        if show_message:
+            QMessageBox.information(self, "Enregistré", "Fichier enregistré avec succès.")
+        return True
 
-    def save_file_as(self) -> None:
+    def save_file_as(self, show_message: bool = True) -> bool:
         if not self.set_file:
-            return
+            return False
         path, _ = QFileDialog.getSaveFileName(
             self, "Enregistrer sous", self.current_path or "", "Fichiers .set (*.set)"
         )
         if not path:
-            return
+            return False
         if not path.lower().endswith(".set"):
             path += ".set"
-        self.current_path = path
-        self.save_file()
-        self.setWindowTitle(f"Éditeur de fichiers .set MT5 — {os.path.basename(path)}")
+        previous_path, self.current_path = self.current_path, path
+        if not self.save_file(show_message):
+            self.current_path = previous_path
+            self._update_title()
+            return False
+        return True
 
     # -------------------------------------------------------------- Filtres
     def _refresh_filter_list(self) -> None:
@@ -691,3 +736,4 @@ class MainWindow(QMainWindow):
         self._set_steps_cell(row, param)
         self.table.blockSignals(False)
         self._update_total()
+        self.setWindowModified(self.is_modified())
